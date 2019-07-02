@@ -5,3 +5,11 @@ authors = ["Neil Ashford <ashfordneil0@gmail.com>"]
 edition = "2018"
 
 [dependencies]
+quinn = "0.3.0"
+tokio = "0.1.21"
+quicli = "0.4.0"
+structopt = "0.2.18"
+log = "0.4.6"
+failure = "0.1.5"
+futures = "0.1.28"
+trust-dns-resolver = "0.11.1"
