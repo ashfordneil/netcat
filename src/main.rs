@@ -1,10 +1,14 @@
 use failure::{bail, Error};
-use futures::Future;
-use log::debug;
+use futures::{future::FutureResult, Future};
+use log::{debug, error, info};
 use quicli::prelude::Verbosity;
+use quinn::Endpoint;
 use std::net::SocketAddr;
 use structopt::StructOpt;
-use tokio::runtime::current_thread::Runtime;
+use tokio::{
+    io::{self, AsyncRead, AsyncWrite},
+    runtime::current_thread::Runtime,
+};
 use trust_dns_resolver::AsyncResolver;
 
 #[derive(Debug, StructOpt)]
@@ -20,6 +24,45 @@ struct QuicOptions {
     /// hostname.
     #[structopt(long = "dns-name")]
     dns_name: Option<String>,
+}
+
+impl QuicOptions {
+    /// Create a connection to the remote address. In case an explicit dns_name was not provided,
+    /// the initial hostname is required for TLS verification of the domain.
+    pub fn connect<'a>(
+        &'a self,
+        address: SocketAddr,
+        hostname: &'a str,
+    ) -> impl 'a + Future<Item = (impl AsyncRead, impl AsyncWrite), Error = Error> {
+        let endpoint = Endpoint::builder().bind("[::]:0").map_err(Error::from).map(
+            |(driver, endpoint, _incomming)| {
+                tokio::spawn(driver.map_err(|err| error!("Endpoint error {}", err)));
+                endpoint
+            },
+        );
+        let endpoint = FutureResult::from(endpoint);
+
+        let server_name = self
+            .dns_name
+            .as_ref()
+            .map(String::as_str)
+            .unwrap_or(hostname);
+
+        let connection = endpoint
+            .and_then(move |endpoint| endpoint.connect(&address, server_name).map_err(Error::from))
+            .and_then(|connecting| connecting.map_err(Error::from))
+            .map(|(driver, connection, _incomming)| {
+                tokio::spawn(driver.map_err(|err| error!("Connection error {}", err)));
+
+                connection
+            });
+
+        let output = connection
+            .and_then(|connection| connection.open_bi().map_err(Error::from))
+            .map(|(send, recv)| (recv, send));
+
+        output.inspect(|_| info!("Connection established"))
+    }
 }
 
 #[derive(Debug, StructOpt)]
@@ -66,7 +109,7 @@ impl Options {
 
         let output = ip.map(move |ip| {
             let addr = (ip, self.port).into();
-            debug!("Found address {}", addr);
+            info!("Found address {}", addr);
             addr
         });
 
@@ -74,14 +117,40 @@ impl Options {
     }
 }
 
+/// Once a streaming connection has been established with the remote, run it to completion.
+/// Connects the read end of the stream to stdout, and the write end of the stream to stdin.
+fn run_stream_connection(
+    recv: impl AsyncRead,
+    send: impl AsyncWrite,
+) -> impl Future<Item = (), Error = Error> {
+    let read = io::stdin();
+    let write = io::stdout();
+
+    let main = Future::join(io::copy(read, send), io::copy(recv, write)).map_err(Error::from);
+
+    main.map(|((sent, _, _), (received, _, _))| {
+        info!(
+            "Connection closed. Sent {} bytes, received {} bytes.",
+            sent, received
+        )
+    })
+}
+
 fn main() -> Result<(), Error> {
     let options = Options::from_args();
     let mut runtime = options.setup()?;
 
     let address = options.get_address();
-    let address = runtime.block_on(address)?;
 
-    println!("{}", address);
+    let conn = address.and_then(|addr| {
+        let Options {
+            protocol, hostname, ..
+        } = &options;
+        let Protocol::Quic(quic_options) = protocol;
+        quic_options.connect(addr, hostname)
+    });
 
-    Ok(())
+    let main = conn.and_then(|(recv, send)| run_stream_connection(recv, send));
+
+    runtime.block_on(main)
 }
